@@ -153,6 +153,7 @@ func processTarget(target string, usernames []string, pauseFileChannel chan stri
 			fmt.Printf("Failed to create UDP connection: %v\n", err)
 			return
 		}
+		defer conn.Close()
 
 		// Generate a console session ID
 		consoleSessionID := make([]byte, 4) // assuming 4-byte length
