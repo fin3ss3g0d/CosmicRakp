@@ -1,14 +1,15 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"cosmicrakp/ipmi"
 	"cosmicrakp/util"
 	"crypto/rand"
 	"encoding/hex"
 	"flag"
 	"fmt"
-	"os"
+	"io/ioutil"
+	"net"
 	"sync"
 	"time"
 )
@@ -22,7 +23,8 @@ var targetFile string
 var usernamesFile string
 var outputFile string
 var numThreads int
-var pauseFileMutex sync.Mutex
+var lastProcessedIPMutex sync.Mutex
+var lastProcessedIP string
 
 func main() {
 	flag.BoolVar(&debugMode, "debug", false, "enable debug mode")
@@ -38,15 +40,13 @@ func main() {
 
 	var usernames []string
 	var err error
+	var wg sync.WaitGroup // Declare a WaitGroup
+	startProcessing := false
 
 	ipChannel := make(chan string, numThreads) // Create a channel with buffer size = numThreads
 	lineChannel := make(chan string, numThreads)
-	pauseFileChannel := make(chan string, numThreads)
 	sem := make(chan struct{}, numThreads) // Semaphore to limit concurrent execution
-	var wg sync.WaitGroup                  // Declare a WaitGroup
 	done := make(chan struct{})
-
-	go writePauseFile(done, pauseFileChannel)
 
 	// Read usernames
 	if usernamesFile != "" {
@@ -56,9 +56,6 @@ func main() {
 			return
 		}
 	}
-
-	// Read the pause file to get a list of targets to skip
-	toSkip := readPauseFile()
 
 	switch operationMode {
 	case "range":
@@ -85,6 +82,16 @@ func main() {
 		fmt.Println("Invalid mode. Use 'range' or 'file'")
 		return
 	}
+
+	// Read the last processed IP from the pause file
+	lastProcessedIP = readLastProcessedIP()
+
+	if lastProcessedIP == "" {
+		startProcessing = true
+	}
+
+	// Start the periodic flush to disk
+	go periodicFlushToDisk(done, 5*time.Second)
 
 	// Main loop to fetch and process targets
 	for {
@@ -113,9 +120,14 @@ func main() {
 		}
 
 		for _, target := range targetBuffer {
-			if _, found := toSkip[target]; found {
-				fmt.Println("Skipping completed target:", target)
-				continue
+			if !startProcessing {
+				if target == lastProcessedIP {
+					startProcessing = true
+					continue
+				} else {
+					fmt.Println("Skipping completed target:", target)
+					continue
+				}
 			}
 
 			if debugMode {
@@ -135,7 +147,7 @@ func main() {
 						fmt.Println("Released token for", target)
 					}
 				}()
-				processTarget(target, usernames, pauseFileChannel)
+				processTarget(target, usernames)
 			}(target)
 		}
 	}
@@ -145,8 +157,8 @@ func main() {
 	close(done) // Close the done channel to signal writePauseFile to terminate
 }
 
-func processTarget(target string, usernames []string, pauseFileChannel chan string) {
-	pauseFileChannel <- target
+func processTarget(target string, usernames []string) {
+	defer updateLastProcessedIP(target)
 	for _, username := range usernames {
 		conn, err := ipmi.CreateUDPConnection(target)
 		if err != nil {
@@ -240,43 +252,46 @@ func processTarget(target string, usernames []string, pauseFileChannel chan stri
 	}
 }
 
-// Read the pause file and return a map of targets to skip
-func readPauseFile() map[string]struct{} {
-	file, err := os.Open("pause_file.txt")
+// Read the last processed IP from the pause file
+func readLastProcessedIP() string {
+	data, err := ioutil.ReadFile("pause_file.txt")
 	if err != nil {
-		return nil
+		return "" // Or the start of your IP range if you wish
 	}
-	defer file.Close()
-
-	toSkip := make(map[string]struct{})
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		toSkip[scanner.Text()] = struct{}{}
-	}
-
-	return toSkip
+	return string(data)
 }
 
-func writePauseFile(done chan struct{}, pauseFileChannel chan string) {
-	file, err := os.OpenFile("pause_file.txt", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		fmt.Printf("Failed to open pause file: %v\n", err)
-		return
-	}
-	defer file.Close()
+// This function periodically writes the highest IP to the pause file
+func periodicFlushToDisk(done chan struct{}, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 
 	for {
 		select {
-		case target := <-pauseFileChannel:
-			pauseFileMutex.Lock()
-			_, err := file.WriteString(target + "\n")
-			if err != nil {
-				fmt.Printf("Failed to write to pause file: %v\n", err)
-			}
-			pauseFileMutex.Unlock()
+		case <-ticker.C:
+			lastProcessedIPMutex.Lock()
+			// Write lastProcessedIP to the file
+			ioutil.WriteFile("pause_file.txt", []byte(lastProcessedIP), 0644)
+			lastProcessedIPMutex.Unlock()
 		case <-done:
-			fmt.Println("Stopping pause file writer.")
+			// Final flush before exiting
+			ioutil.WriteFile("pause_file.txt", []byte(lastProcessedIP), 0644)
 			return
 		}
+	}
+}
+
+func isIPGreater(newIPStr, lastIPStr string) bool {
+	newIP := net.ParseIP(newIPStr)
+	lastIP := net.ParseIP(lastIPStr)
+	return bytes.Compare(newIP, lastIP) > 0
+}
+
+func updateLastProcessedIP(newIP string) {
+	lastProcessedIPMutex.Lock()
+	defer lastProcessedIPMutex.Unlock()
+
+	if isIPGreater(newIP, lastProcessedIP) {
+		lastProcessedIP = newIP
 	}
 }
